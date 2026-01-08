@@ -1,0 +1,197 @@
+# ============================================================
+# SHAP Dependence Plots (POLYNOMIAL FIT ONLY, BLUE POINTS)
+# Uses: D:\Madhav_Krishna\ML\ML.xlsx
+# Inputs after preprocessing: F, M, CA, FA, RCA, w_c, SP, GF, Age
+# Target: CS (change TARGET_COL to "STS" or "FS" if required)
+# Custom SHAP y-axis limits applied per feature (see y_limits)
+# Saves TIFF (300 dpi) in folder shap_dependence_plots_fit
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import shap
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+
+# -------------------- Settings --------------------
+FILE_PATH   = r"D:\Madhav_Krishna\ML\ML.xlsx"
+RAW_COLS    = ["Cement", "F", "M", "CA", "FA", "RCA", "Water", "SP", "GF", "Age"]
+INPUT_COLS  = ["F", "M", "CA", "FA", "RCA", "w/c", "SP", "GF", "Age"]
+TARGET_COL  = "CS"
+SAVE_DIR    = "shap_dependence_plots_fit"
+RANDOM_STATE= 42
+DPI         = 300
+
+FIT_MODE    = "poly"      # polynomial fit only
+POLY_DEGREE = 2
+
+# Font / plotting sizes
+plt.rcParams["font.family"] = "Times New Roman"
+TITLE_FS = 28
+LABEL_FS = 24
+TICK_FS  = 20
+LEGEND_FS= 14
+
+# -------------------- Custom SHAP y-axis limits per feature --------------------
+# Format: (ymin, ymax)
+y_limits = {
+    "F":   (-60.0,  20.0),   # 50 to -100 -> plotted as (-100, 50)
+    "M":   (-10.0,   15.0),   # +20 to -20 -> (-20,20)
+    "CA":  (-25.0,   25.0),
+    "FA":  (-50.0,   50.0),
+    "RCA": (-3.0,    2.0),
+    "w/c": (-100.0, 100.0),
+    "GF":  (-10.0,   5.0),
+    "Age": (-40.0,   20.0),
+    # "SP" not specified by user -> will use automatic scaling
+}
+
+# -------------------- Load data --------------------
+if not os.path.exists(FILE_PATH):
+    raise FileNotFoundError(f"File not found: {FILE_PATH}")
+
+df = pd.read_excel(FILE_PATH)
+df.columns = [str(c).strip() for c in df.columns]
+
+# Validate raw columns and target
+missing_raw = [c for c in RAW_COLS if c not in df.columns]
+if missing_raw:
+    raise ValueError(f"Missing required raw columns: {missing_raw}. Available: {list(df.columns)}")
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Missing target column '{TARGET_COL}'. Available columns: {list(df.columns)}")
+
+# -------------------- Preprocess (compute w/c) --------------------
+for c in RAW_COLS + [TARGET_COL]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# Avoid divide-by-zero: replace zero cement with NaN (will be imputed)
+df["Cement"] = df["Cement"].replace(0, np.nan)
+df["w/c"] = df["Water"] / df["Cement"]
+
+# Construct X and y using reduced inputs and impute numeric NaNs with column mean
+X_df = df[INPUT_COLS].copy()
+y_s  = df[TARGET_COL].copy()
+
+X_df = X_df.fillna(X_df.mean(numeric_only=True))
+y_s  = y_s.fillna(y_s.mean())
+
+# -------------------- Train/test split and model --------------------
+X = X_df.values
+y = y_s.values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=RANDOM_STATE
+)
+X_train_df = pd.DataFrame(X_train, columns=INPUT_COLS)
+X_test_df  = pd.DataFrame(X_test,  columns=INPUT_COLS)
+
+model = xgb.XGBRegressor(
+    objective="reg:squarederror",
+    n_estimators=800,
+    learning_rate=0.05,
+    max_depth=8,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    min_child_weight=3,
+    reg_alpha=1e-6,
+    reg_lambda=1.0,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    tree_method="hist"
+)
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+print(f"Model performance on {TARGET_COL}: RMSE={np.sqrt(mean_squared_error(y_test, y_pred)):.4f} | R²={r2_score(y_test, y_pred):.4f}")
+
+# -------------------- SHAP explainer --------------------
+try:
+    background = shap.utils.sample(X_train_df, min(200, len(X_train_df)), random_state=RANDOM_STATE)
+except Exception:
+    background = X_train_df
+
+explainer = shap.TreeExplainer(model, data=background, feature_perturbation="interventional")
+shap_values = explainer(X_test_df)
+
+# -------------------- Fit helper (polynomial) --------------------
+def _finite_mask(x, y):
+    return np.isfinite(x) & np.isfinite(y)
+
+def poly_fit_line(x, y, degree=2):
+    m = _finite_mask(x, y)
+    x_f, y_f = x[m], y[m]
+    if len(x_f) < degree + 1:
+        return None
+    coeffs = np.polyfit(x_f, y_f, deg=degree)
+    poly   = np.poly1d(coeffs)
+    x_grid = np.linspace(x_f.min(), x_f.max(), 200)
+    y_hat  = poly(x_grid)
+    return x_grid, y_hat
+
+# -------------------- Produce SHAP dependence plots --------------------
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+for feat in INPUT_COLS:
+    idx = INPUT_COLS.index(feat)
+    x_vals = X_test_df[feat].values
+    # shap_values may be Explanation object; .values provides numpy array
+    try:
+        y_shap = shap_values.values[:, idx]
+    except Exception:
+        # fallback if different structure
+        y_shap = np.array([sv[idx] for sv in shap_values])
+
+    plt.figure(figsize=(6, 4.5))
+
+    # Blue scatter, reduced noise
+    plt.scatter(x_vals, y_shap, s=28, color="blue", alpha=0.65, edgecolors="none")
+
+    # Polynomial fit (degree POLY_DEGREE)
+    out = poly_fit_line(x_vals, y_shap, degree=POLY_DEGREE)
+    if out is not None:
+        xg, yg = out
+        plt.plot(xg, yg, linewidth=2.2, linestyle="--", color="red")
+
+    # Labels & ticks
+    plt.xlabel(feat, fontsize=LABEL_FS)
+    plt.ylabel(f"SHAP value ({TARGET_COL})", fontsize=LABEL_FS)
+    plt.xticks(fontsize=TICK_FS)
+    plt.yticks(fontsize=TICK_FS)
+    plt.grid(True, linestyle="--", alpha=0.25)
+
+    # Apply custom y-axis limits if provided, otherwise use a safe margin around data
+    if feat in y_limits and y_limits[feat] is not None:
+        ymin, ymax = y_limits[feat]
+        plt.ylim(ymin, ymax)
+    else:
+        # margin 15% around observed shap values
+        if np.isfinite(y_shap).any():
+            ymin = np.nanmin(y_shap)
+            ymax = np.nanmax(y_shap)
+            if ymin == ymax:
+                # small range fallback
+                ymin -= 0.5
+                ymax += 0.5
+            rng = ymax - ymin
+            plt.ylim(ymin - 0.15 * rng, ymax + 0.15 * rng)
+
+    # 4-side box frame
+    ax = plt.gca()
+    for s in ax.spines.values():
+        s.set_visible(True)
+        s.set_linewidth(1.2)
+        s.set_color("black")
+
+    plt.tight_layout()
+    save_path = os.path.join(SAVE_DIR, f"shap_dep_{feat.replace('/','_')}.tiff")
+    plt.savefig(save_path, dpi=DPI, format="tiff", bbox_inches="tight")
+    plt.show()
+    print(f"Saved: {save_path}")
+
+print("\n✔ All SHAP dependence plots generated with custom y-limits.")
