@@ -1,0 +1,185 @@
+"""
+Two-panel pentagon radar charts (Train & Test) for CS models
+
+Changes kept:
+- Axis labels padded outward so they don't overlap plotted radar lines.
+- "R2" label changed to "R²" (data keys unchanged).
+- Testing outer bounds capped at MAE=1.2, RMSE=2, MSE=4, MAPE=12 unless data exceed cap.
+- Training outer bound capped at RMSE=1.6 (others from data-driven nice round-up).
+- Radius maps 0→outward; per-axis ring labels show real values; no vertex annotations.
+- All text: Times New Roman. Saves a single 300-dpi TIFF.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import math
+import os
+
+# ====================== User Settings ======================
+output_tiff = r"D:\Madhav_Krishna\ML\Model_Results\radar_STS.tiff"
+dpi = 300
+font_family = "Times New Roman"
+
+# If True, Train & Test share the same outer bound per metric.
+use_common_axis_bounds = False
+
+# Number of visible rings (not counting center).
+n_rings = 5
+# ===========================================================
+
+os.makedirs(os.path.dirname(output_tiff), exist_ok=True)
+
+# -------------------- Data (UPDATED) -------------------
+data = {
+    "Model": ["ANN", "SVR", "DT", "RF", "XGB", "LGB"],
+    "Train_MSE":  [0.353, 0.324, 0.238, 0.160, 0.046, 0.135],
+    "Train_RMSE": [0.594, 0.569, 0.488, 0.400, 0.215, 0.368],
+    "Train_MAPE": [6.93, 4.16, 4.51, 3.80, 0.96, 3.73],
+    "Train_MAE":  [0.405, 0.243, 0.264, 0.222, 0.056, 0.218],
+    "Train_R2":   [0.816, 0.831, 0.876, 0.916, 0.976, 0.929],
+    "Test_MSE":   [0.553, 0.459, 0.442, 0.317, 0.254, 0.292],
+    "Test_RMSE":  [0.744, 0.678, 0.664, 0.563, 0.504, 0.540],
+    "Test_MAPE":  [8.68, 5.94, 6.56, 5.74, 4.69, 6.03],
+    "Test_MAE":   [0.479, 0.328, 0.362, 0.317, 0.259, 0.333],
+    "Test_R2":    [0.666, 0.723, 0.733, 0.809, 0.847, 0.824]
+}
+df = pd.DataFrame(data)
+
+# --------------- Config / Helpers -------------
+metrics_order = ["R2", "MAE", "RMSE", "MSE", "MAPE"]           # data keys (unchanged)
+display_labels = ["R\u00b2", "MAE", "RMSE", "MSE", "MAPE"]     # labels shown on plot
+
+# Per-split caps for the outer bounds
+max_bounds_override = {
+    "Train": {"RMSE": 0.6, "MSE": 0.4, "MAPE": 8.0},                         # <-- new training cap
+    "Test":  {"MAE": 0.5, "RMSE": 0.8, "MSE": 0.6, "MAPE": 10.0},  # <-- new testing caps
+}
+
+def ensure_font(font_name: str):
+    plt.rcParams.update({"font.family": font_name, "font.size": 14})
+    try:
+        fm.findfont(font_name, fallback_to_default=False)
+    except Exception:
+        print(f"Note: '{font_name}' not found on this system. A fallback font will be used.")
+
+def nice_round_up(x: float) -> float:
+    if x <= 0:
+        return 1.0
+    exp = math.floor(math.log10(x))
+    frac = x / (10 ** exp)
+    if   frac <= 1:   nice = 1
+    elif frac <= 2:   nice = 2
+    elif frac <= 2.5: nice = 2.5
+    elif frac <= 5:   nice = 5
+    else:             nice = 10
+    return nice * (10 ** exp)
+
+def compute_axis_bounds(df, which):
+    bounds = []
+    for m in metrics_order:
+        if m == "R2":
+            bounds.append(1.0)
+            continue
+        # choose max within the split (or across both if you toggle use_common_axis_bounds)
+        if use_common_axis_bounds:
+            both = pd.concat([df[f"Train_{m}"], df[f"Test_{m}"]], axis=0).astype(float).values
+            ymax = float(np.nanmax(both))
+        else:
+            ymax = float(np.nanmax(df[f"{which}_{m}"].astype(float).values))
+        base_bound = nice_round_up(ymax)
+
+        # apply optional cap without clipping real data
+        cap = max_bounds_override.get(which, {}).get(m)
+        if cap is not None and ymax <= cap:
+            bounds.append(cap)
+        else:
+            bounds.append(base_bound)
+    return np.array(bounds, dtype=float)
+
+def radar_angles(n_metrics: int):
+    ang = np.linspace(0, 2*np.pi, n_metrics, endpoint=False).tolist()
+    ang += ang[:1]
+    return ang
+
+def close_vals(a):
+    a = a.tolist()
+    a += a[:1]
+    return a
+
+def format_tick(v, mname):
+    if mname == "R2":
+        return f"{v:.2f}"
+    elif mname == "MAPE":
+        return f"{v:.2f}"
+    else:
+        if v >= 100:
+            return f"{v:.0f}"
+        elif v >= 10:
+            return f"{v:.1f}"
+        else:
+            return f"{v:.2f}"
+
+def draw_per_axis_ring_labels(ax, angles, bounds, nticks=5, label_size=12, pad=0.0):
+    radii = np.linspace(1/nticks, 1.0, nticks)
+    for j, ang in enumerate(angles[:-1]):
+        bound = bounds[j]
+        mname = metrics_order[j]
+        vals = (radii * bound)
+        for r, val in zip(radii, vals):
+            ax.text(ang, r + pad, format_tick(val, mname),
+                    ha="center", va="center", fontsize=label_size)
+
+def plot_radar(ax, df, which, title, nticks=5):
+    bounds = compute_axis_bounds(df, which)
+
+    cols = [f"{which}_{m}" for m in metrics_order]
+    raw = df[cols].astype(float).values
+    norm = np.clip(raw / bounds[None, :], 0, 1)
+
+    angles = radar_angles(len(metrics_order))
+
+    ax.set_theta_offset(np.pi / 2)   # R² at top
+    ax.set_theta_direction(-1)       # clockwise
+
+    for i, model in enumerate(df["Model"]):
+        vals = norm[i]
+        ax.plot(angles, close_vals(vals), linewidth=2, marker="o", label=model)
+        ax.fill(angles, close_vals(vals), alpha=0.12)
+
+    rticks = np.linspace(1/nticks, 1.0, nticks).tolist()
+    ax.set_yticks(rticks)
+    ax.set_yticklabels([""]*len(rticks))
+    ax.yaxis.grid(True, linestyle="--", linewidth=0.7)
+    ax.xaxis.grid(True, linestyle=":", linewidth=0.6)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(display_labels, fontsize=14)
+    ax.tick_params(axis="x", pad=14)  # keep labels away from the radar lines
+
+    draw_per_axis_ring_labels(ax, angles, bounds, nticks=nticks, label_size=12, pad=0.0)
+    ax.set_title(title, fontsize=14, pad=6)
+
+# -------------------- Render & Save ------------------------
+plt.rcParams.update({
+    "font.family": font_family,
+    "mathtext.default": "regular"
+})
+ensure_font(font_family)
+
+fig = plt.figure(figsize=(10, 5))
+ax1 = plt.subplot(1, 2, 1, polar=True)
+ax2 = plt.subplot(1, 2, 2, polar=True)
+
+plot_radar(ax1, df, "Train", "Training", nticks=n_rings)
+plot_radar(ax2, df, "Test",  "Testing",  nticks=n_rings)
+
+handles, labels = ax1.get_legend_handles_labels()
+fig.legend(handles, labels, loc="upper center", ncol=3, fontsize=14)
+
+plt.tight_layout(rect=[0, 0.08, 1, 1])
+fig.savefig(output_tiff, dpi=dpi, format="tiff", bbox_inches="tight")
+plt.show()
+
+print(f"Saved radar plot to: {output_tiff}")
