@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""
+cs_predictor_gui_maxpred_full_with_fixed_ranges.py
+
+Same GUI as before but with specific unit and displayed ranges set:
+- SP unit set to kg/m³ (you called it SF -> mapped to SP)
+- GF unit set to %
+- Preset display ranges:
+    GF: [0 - 3]
+    Cement: [250 - 940]
+    CA: [0 - 1500]
+    FA: [550 - 1100]
+    RCA: [0 - 1500]
+    Water: [150 - 380]
+
+No other behavior changed.
+"""
+
+import tkinter as tk
+from tkinter import messagebox
+import threading
+import pandas as pd
+import numpy as np
+import re
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.neural_network import MLPRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from scipy.stats import randint, uniform
+
+# ------------------ USER CONFIG ------------------
+FILE_PATH = r"D:\Madhav_Krishna\ML\ML.xlsx"   # your Excel dataset (auto-load)
+# -------------------------------------------------
+
+# INPUT FEATURES (STS, FS removed)
+FEATURES = ["Cement", "F", "M", "CA", "FA", "RCA", "Water", "SP", "GF", "Age"]
+TARGET = "CS"
+
+# Units (updated per your instruction)
+UNITS = {
+    "Cement": "kg/m³",
+    "F": "kg/m³",
+    "M": "kg/m³",
+    "CA": "kg/m³",
+    "FA": "kg/m³",
+    "RCA": "kg/m³",
+    "Water": "kg/m³",
+    "SP": "kg/m³",   # you said SF -> mapped to SP
+    "GF": "%",       # change to percent
+    "Age": "days"
+}
+
+# Preset ranges to display (these override the auto-computed df ranges in the GUI labels)
+PRESET_RANGES = {
+    "GF": (0, 3),
+    "Cement": (250, 940),
+    "CA": (0, 1500),
+    "FA": (550, 1100),
+    "RCA": (0, 1500),
+    "Water": (150, 380),
+}
+
+# Simple param distributions for RandomizedSearchCV (lightweight)
+PARAM_DIST = {
+    "MLP": {
+        "est__hidden_layer_sizes": [(50,), (100,), (50, 50)],
+        "est__alpha": uniform(1e-6, 1e-2),
+        "est__learning_rate_init": uniform(1e-4, 1e-2),
+    },
+    "DT": {
+        "est__max_depth": randint(2, 30),
+        "est__min_samples_split": randint(2, 20),
+    },
+    "SVR": {
+        "est__C": uniform(0.1, 100),
+        "est__epsilon": uniform(1e-3, 0.5),
+    },
+    "RF": {
+        "est__n_estimators": randint(50, 200),
+        "est__max_depth": randint(3, 30),
+        "est__max_features": ["auto", "sqrt", "log2"],
+    },
+    "XGB": {
+        "est__n_estimators": randint(50, 200),
+        "est__max_depth": randint(3, 12),
+        "est__learning_rate": uniform(0.01, 0.2),
+    },
+    "LGB": {
+        "est__n_estimators": randint(50, 200),
+        "est__num_leaves": randint(16, 128),
+        "est__learning_rate": uniform(0.01, 0.2),
+    }
+}
+
+
+def clean_series_to_numeric(s: pd.Series):
+    """Clean a pandas Series containing numeric-like strings and convert to numeric."""
+    s_str = s.astype(str).fillna("")
+    cleaned = s_str.str.replace(r"[^0-9eE\+\-\.]", "", regex=True)
+    cleaned = cleaned.replace("", np.nan)
+    numeric = pd.to_numeric(cleaned, errors="coerce")
+    return numeric
+
+
+def build_pipelines(random_state=42):
+    """Return simple pipelines (scaler + estimator)"""
+    pipes = {
+        "MLP": Pipeline([("scaler", StandardScaler()), ("est", MLPRegressor(max_iter=400, random_state=random_state))]),
+        "DT": Pipeline([("scaler", StandardScaler()), ("est", DecisionTreeRegressor(random_state=random_state))]),
+        "SVR": Pipeline([("scaler", StandardScaler()), ("est", SVR())]),
+        "RF": Pipeline([("scaler", StandardScaler()), ("est", RandomForestRegressor(random_state=random_state))]),
+        "XGB": Pipeline([("scaler", StandardScaler()), ("est", XGBRegressor(objective='reg:squarederror', random_state=random_state, verbosity=0))]),
+        "LGB": Pipeline([("scaler", StandardScaler()), ("est", LGBMRegressor(random_state=random_state))]),
+    }
+    return pipes
+
+
+class CSPredictorApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("CS Predictor_Bayesian Optimization_GFRC")
+        self.geometry("800x450")
+        self.configure(bg="#0d1117")
+
+        # Header
+        header = tk.Frame(self, bg="#ff6f61", height=70)
+        header.pack(fill="x", padx=8, pady=8)
+        tk.Label(header, text="GUI for Predicting Compressive Strength of Metakolin based GFRC", font=("Helvetica", 16, "bold"),
+                 bg="#ff6f61", fg="white").pack(pady=10)
+
+        body = tk.Frame(self, bg="white")
+        body.pack(fill="both", expand=True, padx=8, pady=(0,8))
+
+        # Left - manual inputs (with units and range labels)
+        left = tk.Frame(body, bg="#071018")
+        left.pack(side="left", fill="y", padx=8, pady=8)
+        tk.Label(left, text="Input Values", bg="#071018", fg="white", font=("Helvetica", 14, "bold")).pack(pady=6)
+
+        # We'll keep references to unit labels and range labels so we can update ranges after loading
+        self.entries = {}
+        self.unit_labels = {}
+        self.range_labels = {}
+
+        entry_bg = "#fffbe6"
+        for feat in FEATURES:
+            frm = tk.Frame(left, bg="#071018")
+            frm.pack(fill="x", padx=6, pady=3)
+
+            lbl_name = tk.Label(frm, text=feat, width=8, anchor="w", bg="#071018", fg="white")
+            lbl_name.pack(side="left")
+
+            ent = tk.Entry(frm, width=12, bg=entry_bg)
+            ent.pack(side="left", padx=4)
+            self.entries[feat] = ent
+
+            # Unit label (static)
+            unit_text = UNITS.get(feat, "")
+            unit_lbl = tk.Label(frm, text=unit_text, width=8, anchor="w", bg="#071018", fg="#cfe8ff")
+            unit_lbl.pack(side="left", padx=(6,2))
+            self.unit_labels[feat] = unit_lbl
+
+            # Range label (dynamic, initially showing preset if exists else blank)
+            if feat in PRESET_RANGES:
+                mn, mx = PRESET_RANGES[feat]
+                range_text = f"[{mn} - {mx}]"
+            else:
+                range_text = "[ - ]"
+            range_lbl = tk.Label(frm, text=range_text, width=14, anchor="w", bg="#071018", fg="#bfe1a6")
+            range_lbl.pack(side="left", padx=(4,2))
+            self.range_labels[feat] = range_lbl
+
+        # default Age
+        if "Age" in self.entries:
+            self.entries["Age"].insert(0, "28")
+
+        btns = tk.Frame(left, bg="#071018")
+        btns.pack(pady=8)
+        tk.Button(btns, text="Train Dataset", command=self.start_training, bg="#6ee7b7", width=12).pack(side="left", padx=6)
+        tk.Button(btns, text="Predict Model", command=self.predict_all_models, bg="#ffd166", width=18).pack(side="left", padx=6)
+        tk.Button(btns, text="Exit", command=self.load_excel, bg="#8ad0ff", width=12).pack(side="left", padx=6)
+
+        # Middle - options & logs
+        mid = tk.Frame(body, bg="#071018")
+        mid.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+
+        # Mode selector: Quick or Tune
+        mode_fr = tk.Frame(mid, bg="#071018")
+        mode_fr.pack(fill="x", pady=4)
+        tk.Label(mode_fr, text="Mode:", bg="#071018", fg="white").pack(side="left")
+        self.mode_var = tk.StringVar(master=self, value="quick")
+        tk.Radiobutton(mode_fr, text="Quick (no tuning)", variable=self.mode_var, value="quick", bg="#071018", fg="white", selectcolor="#071018").pack(side="left", padx=6)
+        tk.Radiobutton(mode_fr, text="Tune (Bayesian Optimization)", variable=self.mode_var, value="tune", bg="#071018", fg="white", selectcolor="#071018").pack(side="left", padx=6)
+
+        tune_fr = tk.Frame(mid, bg="#071018")
+        tune_fr.pack(fill="x", pady=4)
+        tk.Label(tune_fr, text="n_iter:", bg="#071018", fg="white").pack(side="left")
+        self.iter_spin = tk.Spinbox(tune_fr, from_=5, to=200, width=6)
+        self.iter_spin.delete(0, "end"); self.iter_spin.insert(0, "10")
+        self.iter_spin.pack(side="left", padx=6)
+        tk.Label(tune_fr, text="CV:", bg="#071018", fg="white").pack(side="left", padx=(8,0))
+        self.cv_spin = tk.Spinbox(tune_fr, from_=2, to=10, width=4)
+        self.cv_spin.delete(0, "end"); self.cv_spin.insert(0, "3")
+        self.cv_spin.pack(side="left", padx=6)
+        tk.Label(tune_fr, text="(If mode=Quick, these are ignored)", bg="#071018", fg="#9aa", font=("Helvetica",8)).pack(side="left", padx=8)
+
+        tk.Label(mid, text="Log / Output", bg="#071018", fg="white").pack(anchor="w", pady=(8,0))
+        self.log = tk.Text(mid, height=28, bg="#022733", fg="#e6fff9")
+        self.log.pack(fill="both", expand=True, pady=6)
+
+        # Right - best model & prediction
+        right = tk.Frame(body, bg="#071018")
+        right.pack(side="left", fill="y", padx=8, pady=8)
+        tk.Label(right, text="Selected Best Model", bg="#071018", fg="white", font=("Helvetica", 12, "bold")).pack(pady=6)
+        self.best_model_var = tk.StringVar(master=self, value="None")
+        tk.Label(right, textvariable=self.best_model_var, bg="#0f1b21", fg="#fff", width=26, height=2, relief="groove").pack(pady=6)
+
+        tk.Label(right, text="Prediction CS", bg="#071018", fg="white", font=("Helvetica", 12, "bold")).pack(pady=(12,6))
+        self.pred_var = tk.StringVar(master=self, value="—")
+        tk.Label(right, textvariable=self.pred_var, bg="#10232a", fg="#ffd9b3", width=20, height=2, relief="sunken").pack(pady=4)
+
+        # internals
+        self.df = None
+        self.trained_models = {}
+
+        # auto-load dataset
+        self.load_excel()
+
+    def log_write(self, text: str):
+        self.log.insert("end", f"{text}\n")
+        self.log.see("end")
+
+    def _update_range_labels(self):
+        """Update the [min - max] labels for each feature based on self.df, but show preset if given."""
+        for feat in FEATURES:
+            # use preset if available
+            if feat in PRESET_RANGES:
+                mn, mx = PRESET_RANGES[feat]
+                range_text = f"[{mn} - {mx}]"
+            else:
+                if self.df is None or feat not in self.df.columns:
+                    range_text = "[ - ]"
+                else:
+                    mn = self.df[feat].min()
+                    mx = self.df[feat].max()
+                    def fmt(x):
+                        if pd.isna(x):
+                            return "-"
+                        if float(x).is_integer():
+                            return f"{int(x)}"
+                        return f"{round(float(x), 3)}"
+                    range_text = f"[{fmt(mn)} - {fmt(mx)}]"
+            self.range_labels[feat].config(text=range_text)
+
+    def load_excel(self):
+        """Load and clean the Excel file (auto) and update range labels."""
+        try:
+            df = pd.read_excel(FILE_PATH)
+        except FileNotFoundError:
+            self.log_write(f"Excel file not found: {FILE_PATH}")
+            messagebox.showwarning("File not found", f"Could not find: {FILE_PATH}")
+            self.df = None
+            self._update_range_labels()
+            return
+        except Exception as e:
+            self.log_write(f"Error reading Excel: {e}")
+            messagebox.showerror("Error", f"Could not read Excel: {e}")
+            self.df = None
+            self._update_range_labels()
+            return
+
+        required = set(FEATURES + [TARGET])
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            self.log_write(f"Missing required columns: {missing}")
+            messagebox.showerror("Missing columns", f"Please ensure sheet has: {sorted(list(required))}")
+            self.df = None
+            self._update_range_labels()
+            return
+
+        n_before = len(df)
+        for col in list(FEATURES) + [TARGET]:
+            self.log_write(f"Cleaning column: {col}")
+            df[col] = clean_series_to_numeric(df[col])
+        df_clean = df.dropna(subset=list(FEATURES) + [TARGET]).reset_index(drop=True)
+        n_after = len(df_clean)
+        dropped = n_before - n_after
+        self.log_write(f"Rows before: {n_before}, after cleaning: {n_after}, dropped: {dropped}")
+
+        if n_after == 0:
+            messagebox.showerror("No valid data", "No numeric rows left after cleaning.")
+            self.df = None
+            self._update_range_labels()
+            return
+
+        self.df = df_clean.copy()
+        messagebox.showinfo("Loaded", f"Loaded and cleaned ({n_after} rows kept, {dropped} dropped).")
+        self.log_write(f"Loaded: {FILE_PATH} (rows kept={n_after})")
+
+        # update range labels (preset ranges will still override where set)
+        self._update_range_labels()
+
+    def start_training(self):
+        if self.df is None:
+            messagebox.showwarning("No data", "Please load dataset first.")
+            return
+        t = threading.Thread(target=self._train_models_thread, daemon=True)
+        t.start()
+
+    def _train_models_thread(self):
+        """Train all models. Works in background thread and logs errors."""
+        try:
+            self.log_write("Starting training...")
+            X = self.df[FEATURES].values
+            y = self.df[TARGET].values
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=42)
+
+            pipes = build_pipelines()
+            mode = self.mode_var.get()
+            n_iter = int(self.iter_spin.get())
+            cv = int(self.cv_spin.get())
+
+            self.trained_models = {}
+            self.log_write("Models trained will be used for manual predictions. R² values (if shown) are for info only.")
+
+            for name, pipe in pipes.items():
+                self.log_write(f"Training {name} ... (mode={mode})")
+                est = None
+
+                if mode == "tune":
+                    param_dist = PARAM_DIST.get(name, {})
+                    if param_dist:
+                        try:
+                            rs = RandomizedSearchCV(pipe, param_distributions=param_dist,
+                                                    n_iter=max(5, n_iter), cv=max(2, cv),
+                                                    n_jobs=1, scoring="r2", random_state=0, verbose=0)
+                            rs.fit(X_train, y_train)
+                            est = rs.best_estimator_
+                            params_safe = {k.replace("est__", ""): (v if not hasattr(v, "tolist") else v.tolist())
+                                           for k, v in rs.best_params_.items()}
+                            self.log_write(f"  Best params: {params_safe}")
+                        except Exception as e:
+                            self.log_write(f"  Tuning failed for {name}: {e}. Falling back to .fit()")
+                            try:
+                                pipe.fit(X_train, y_train)
+                                est = pipe
+                            except Exception as e2:
+                                self.log_write(f"  Fallback fit failed for {name}: {e2}. Skipping.")
+                                continue
+                    else:
+                        try:
+                            pipe.fit(X_train, y_train)
+                            est = pipe
+                        except Exception as e:
+                            self.log_write(f"  Fit failed for {name}: {e}. Skipping.")
+                            continue
+                else:
+                    try:
+                        pipe.fit(X_train, y_train)
+                        est = pipe
+                    except Exception as e:
+                        self.log_write(f"  Fit failed for {name}: {e}. Skipping.")
+                        continue
+
+                # Evaluate but do NOT use R² to pick best
+                try:
+                    r2 = est.score(X_test, y_test)
+                    self.log_write(f"  (Info) Test R² ({name}): {r2:.4f}")
+                except Exception as e:
+                    self.log_write(f"  Scoring failed for {name}: {e}")
+
+                self.trained_models[name] = est
+
+            if not self.trained_models:
+                self.log_write("No models successfully trained.")
+                messagebox.showwarning("Training", "No models trained successfully.")
+                return
+
+            self.log_write("Training finished. Use 'Predict (All models)' to see each model's prediction for your manual input.")
+            messagebox.showinfo("Training finished", f"Training finished. {len(self.trained_models)} models ready.")
+        except Exception as e:
+            self.log_write(f"Training aborted: {e}")
+            messagebox.showerror("Training error", str(e))
+
+    def _clean_manual_value(self, raw: str):
+        v_clean = re.sub(r"[^0-9eE\+\-\.]", "", raw)
+        if v_clean == "":
+            raise ValueError(f"Invalid numeric input: {raw!r}")
+        return float(v_clean)
+
+    def predict_all_models(self):
+        """
+        Predict CS for the manual input using all trained models.
+        - Warns if any manual input is outside training range for that feature.
+        - For each model: logs raw prediction and clamped prediction within observed CS range.
+        - Selects model with maximum *clamped* prediction as 'selected (max)'.
+        - Also displays mean and median of clamped predictions.
+        """
+        if not self.trained_models:
+            messagebox.showwarning("Not trained", "No trained models found. Please Train first.")
+            return
+
+        # collect manual input
+        try:
+            vals = []
+            out_of_range = []
+            for feat in FEATURES:
+                raw = self.entries[feat].get().strip()
+                if raw == "":
+                    raise ValueError(f"Empty value for {feat}")
+                val = self._clean_manual_value(raw)
+                vals.append(val)
+
+                # check against training range if df available and preset not forcing display
+                if self.df is not None and feat in self.df.columns:
+                    col_min = float(self.df[feat].min())
+                    col_max = float(self.df[feat].max())
+                    # Use preset for display only; for out-of-range warning we compare to actual df range
+                    if val < col_min or val > col_max:
+                        out_of_range.append((feat, val, col_min, col_max))
+        except Exception as e:
+            messagebox.showerror("Input error", str(e))
+            return
+
+        # show warning if any feature out of training range
+        if out_of_range:
+            msg_lines = ["Warning: manual input outside training range:"]
+            for feat, v, mn, mx in out_of_range:
+                msg_lines.append(f"  {feat}: {v}  (train range: {mn} — {mx})")
+            msg_lines.append("Predictions may be unreliable or strongly extrapolated.")
+            for L in msg_lines:
+                self.log_write(L)
+            # show popup with first few lines
+            messagebox.showwarning("Out of training range", "\n".join(msg_lines[:10]))
+
+        arr = np.array(vals).reshape(1, -1)
+
+        # compute observed CS range for clamping
+        cs_min = float(self.df[TARGET].min()) if (self.df is not None and TARGET in self.df.columns) else None
+        cs_max = float(self.df[TARGET].max()) if (self.df is not None and TARGET in self.df.columns) else None
+        if cs_min is None or cs_max is None:
+            cs_min, cs_max = None, None
+
+        raw_preds = {}
+        clamped_preds = {}
+
+        for name, est in self.trained_models.items():
+            try:
+                p_raw = float(est.predict(arr)[0])
+                raw_preds[name] = p_raw
+                if cs_min is not None and cs_max is not None:
+                    p_clamped = min(max(p_raw, cs_min), cs_max)
+                else:
+                    p_clamped = p_raw
+                clamped_preds[name] = p_clamped
+                self.log_write(f"{name}: raw = {p_raw:.4f} MPa; clamped = {p_clamped:.4f} MPa")
+            except Exception as e:
+                self.log_write(f"Prediction failed for {name}: {e}")
+
+        if not clamped_preds:
+            messagebox.showerror("Prediction error", "All model predictions failed.")
+            return
+
+        # pick model with maximum clamped predicted CS
+        best_name = max(clamped_preds, key=clamped_preds.get)
+        best_val = clamped_preds[best_name]
+
+        # aggregate stats
+        clamped_values = np.array(list(clamped_preds.values()))
+        mean_val = float(np.mean(clamped_values))
+        median_val = float(np.median(clamped_values))
+
+        # Update UI
+        self.best_model_var.set(best_name)
+        self.pred_var.set(f"{best_val:.3f} MPa ({best_name})")
+        self.log_write(f"Selected (max clamped) model: {best_name} with predicted CS = {best_val:.4f} MPa")
+        self.log_write(f"Aggregate (clamped) -> mean: {mean_val:.4f} MPa; median: {median_val:.4f} MPa")
+
+
+if __name__ == "__main__":
+    app = CSPredictorApp()
+    app.mainloop()
