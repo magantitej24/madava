@@ -1,0 +1,127 @@
+# ============================================================
+# Performance Metrics Table for CS Prediction (Your Data)
+# Models: ANN, SVR, DT, RF, XGB, LGB
+# Output: Training & Testing MSE, RMSE, MAPE, MAE, R²
+# Saves: Excel + CSV + Console Table
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+from sklearn.neural_network import MLPRegressor
+from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+
+# ---------------- USER SETTINGS ----------------
+FILE_PATH = r"D:\Madhav_Krishna\ML\ML.xlsx"
+TARGET_COL = "FS"
+INPUT_COLS = ["Cement","F","M","CA","FA","RCA","Water","SP","GF","Age"]
+
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+OUT_EXCEL = "FS_Performance_Table.xlsx"
+OUT_CSV   = "FS_Performance_Table.csv"
+# ------------------------------------------------
+
+# ---------------- LOAD DATA ----------------
+df = pd.read_excel(FILE_PATH)
+df.columns = df.columns.astype(str).str.strip()
+
+df[INPUT_COLS + [TARGET_COL]] = df[INPUT_COLS + [TARGET_COL]].apply(
+    pd.to_numeric, errors="coerce"
+)
+
+df = df.fillna(df.mean(numeric_only=True))
+
+X = df[INPUT_COLS].values
+y = df[TARGET_COL].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+)
+
+# ---------------- MODELS ----------------
+models = {
+    "ANN": Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", MLPRegressor(hidden_layer_sizes=(120,120), learning_rate_init=0.007,
+                               solver="adam", max_iter=2000, random_state=RANDOM_STATE))
+    ]),
+    "SVR": Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", SVR(C=58.097, epsilon=0.01, gamma="auto", kernel="rbf"))
+    ]),
+    "DT": DecisionTreeRegressor(max_depth=10, min_samples_split=4, random_state=RANDOM_STATE),
+    "RF": RandomForestRegressor(n_estimators=300, max_depth=12,
+                                min_samples_split=4, bootstrap=True,
+                                random_state=RANDOM_STATE, n_jobs=-1),
+    "XGB": XGBRegressor(learning_rate=0.08, n_estimators=250,
+                        max_depth=10, subsample=0.8,
+                        objective="reg:squarederror",
+                        random_state=RANDOM_STATE),
+    "LGB": LGBMRegressor(learning_rate=0.07, n_estimators=250,
+                         num_leaves=25, feature_fraction=0.8,
+                         random_state=RANDOM_STATE)
+}
+
+# ---------------- METRIC FUNCTION ----------------
+def metrics(y_true, y_pred):
+    mse  = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae  = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    r2   = r2_score(y_true, y_pred)
+    return mse, rmse, mape, mae, r2
+
+# ---------------- BUILD PERFORMANCE TABLE ----------------
+rows = []
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+
+    ytr_pred = model.predict(X_train)
+    yts_pred = model.predict(X_test)
+
+    tr_mse, tr_rmse, tr_mape, tr_mae, tr_r2 = metrics(y_train, ytr_pred)
+    ts_mse, ts_rmse, ts_mape, ts_mae, ts_r2 = metrics(y_test,  yts_pred)
+
+    rows.append([
+        name,
+        tr_mse, tr_rmse, tr_mape, tr_mae, tr_r2,
+        ts_mse, ts_rmse, ts_mape, ts_mae, ts_r2
+    ])
+
+cols = [
+    "Model",
+    "Train_MSE", "Train_RMSE", "Train_MAPE", "Train_MAE", "Train_R2",
+    "Test_MSE",  "Test_RMSE",  "Test_MAPE",  "Test_MAE",  "Test_R2"
+]
+
+perf_df = pd.DataFrame(rows, columns=cols)
+
+# Round to 3 decimals (journal-ready)
+perf_df.iloc[:,1:] = perf_df.iloc[:,1:].astype(float).round(3)
+
+# ---------------- SAVE + DISPLAY ----------------
+perf_df.to_excel(OUT_EXCEL, index=False)
+perf_df.to_csv(OUT_CSV, index=False)
+
+print("\n✅ Performance Metrics Table (Your Data):\n")
+print(perf_df)
+
+print("\nSaved files:")
+print(OUT_EXCEL)
+print(OUT_CSV)
