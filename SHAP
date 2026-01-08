@@ -1,0 +1,235 @@
+# ============================================
+# XGBoost + SHAP for STS with w/c implemented
+# File: D:\Madhav_Krishna\ML\ML.xlsx  (update path if needed)
+# Original Inputs: Cement, F, M, CA, FA, RCA, Water, SP, GF, Age
+# New Inputs after preprocessing: F, M, CA, FA, RCA, w/c, SP, GF, Age
+# Target:  STS
+# Outputs: SHAP bar, heatmap, beeswarm (TIFF 300 dpi)
+# Font: Times New Roman (all labels, ticks, and colorbars scaled)
+# ============================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+
+import xgboost as xgb
+import shap
+
+# --------- Settings ---------
+FILE_PATH   = r"D:\Madhav_Krishna\ML\ML.xlsx"   # <-- replace with actual Excel path if needed
+# Note: Cement and Water are present in raw file; code will compute w/c = Water / Cement
+INPUT_COLS_RAW = ["Cement", "F", "M", "CA", "FA", "RCA", "Water", "SP", "GF", "Age"]
+# After computing w/c we will use:
+INPUT_COLS = ["F", "M", "CA", "FA", "RCA", "w/c", "SP", "GF", "Age"]
+
+TARGET_COL  = "STS"   # output changed to split tensile strength
+TEST_SIZE   = 0.2
+RANDOM_STATE= 42
+MAX_DISPLAY = 20
+SAVE_TIFF   = True
+
+# Global font setup
+plt.rcParams["font.family"] = "Times New Roman"
+
+# Base font sizes (change here to scale everything)
+TICK_FS      = 22
+LABEL_FS     = 28
+TITLE_FS     = 30
+COLORBAR_FS  = 22   # <-- Colorbar tick labels & title (Low/High, numeric range, “SHAP value”)
+
+# ---------- Helpers ----------
+def enlarge_colorbar_fonts(fig, colorbar_fs=COLORBAR_FS, labelpad=18):
+    """
+    Try to find SHAP-created colorbar axis and enlarge its tick & label fonts.
+    Works for SHAP heatmap and beeswarm.
+    """
+    try:
+        cax = fig.axes[-1]
+        cax.tick_params(labelsize=colorbar_fs)
+        ylabel = cax.get_ylabel()
+        if ylabel:
+            cax.set_ylabel(ylabel, fontsize=colorbar_fs, labelpad=labelpad)
+        xlabel = cax.get_xlabel()
+        if xlabel:
+            cax.set_xlabel(xlabel, fontsize=colorbar_fs, labelpad=labelpad)
+        for tick in cax.get_xticklabels() + cax.get_yticklabels():
+            tick.set_fontsize(colorbar_fs)
+    except Exception:
+        pass
+
+def read_table_fallback(path):
+    """
+    Try to read an Excel/CSV first, otherwise attempt to extract the largest table from a docx.
+    Returns a pandas DataFrame.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    # Try Excel/CSV first
+    try:
+        if ext in [".xlsx", ".xls"]:
+            return pd.read_excel(path)
+        if ext == ".csv":
+            return pd.read_csv(path)
+        # If not excel/csv, try excel read anyway (some environments provide path)
+        return pd.read_excel(path)
+    except Exception:
+        # Try docx fallback
+        if ext == ".docx":
+            try:
+                from docx import Document
+                doc = Document(path)
+                tables = doc.tables
+                if len(tables) == 0:
+                    raise ValueError("No tables found in docx file.")
+                # choose the largest table by cells
+                best = max(tables, key=lambda t: len(t.rows) * len(t.columns))
+                data = []
+                for i, row in enumerate(best.rows):
+                    cells = [cell.text.strip() for cell in row.cells]
+                    data.append(cells)
+                df = pd.DataFrame(data)
+                df.columns = df.iloc[0].values
+                df = df.drop(df.index[0]).reset_index(drop=True)
+                return df
+            except Exception as e:
+                raise RuntimeError("Unable to read docx table. Please provide an Excel or CSV file.") from e
+        raise RuntimeError("Unable to read file. Please provide an Excel (.xlsx/.xls) or CSV, or a docx with a single table.")
+
+# ------------ Main ---------------
+# 1) Load file (Excel or docx table)
+df = read_table_fallback(FILE_PATH)
+print(f"Loaded: {FILE_PATH} | shape={df.shape}")
+
+# Normalize column names
+df.columns = [str(c).strip() for c in df.columns]
+
+# 2) Validate required raw columns (we need Cement and Water to compute w/c)
+missing_raw = [c for c in INPUT_COLS_RAW if c not in df.columns]
+if missing_raw:
+    raise ValueError(f"Missing one or more raw input columns required for preprocessing: {missing_raw}. Available: {list(df.columns)}")
+if TARGET_COL not in df.columns:
+    raise ValueError(f"Missing target: '{TARGET_COL}'. Available columns: {list(df.columns)}")
+
+# 3) Compute water/cement ratio (w/c) and construct new input dataframe
+# Convert numeric where possible
+for col in INPUT_COLS_RAW + [TARGET_COL]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Avoid division by zero: replace zeros in Cement with NaN so mean-imputation handles them
+df["Cement"] = df["Cement"].replace(0, np.nan)
+
+# Compute w/c
+df["w/c"] = df["Water"] / df["Cement"]
+
+# Now prepare input X and target y using the new input set
+X = df[INPUT_COLS].copy()   # uses w/c instead of Cement & Water
+y = df[TARGET_COL].copy()
+
+# Impute numeric NaNs with column mean (simple & reproducible)
+X = X.fillna(X.mean(numeric_only=True))
+y = y.fillna(y.mean())
+
+# Convert to numpy arrays
+X_vals = X.values
+y_vals = y.values
+print(f"Using {X_vals.shape[0]} samples and {X_vals.shape[1]} features: {INPUT_COLS}")
+
+# 4) Split
+X_train, X_test, y_train, y_test = train_test_split(
+    X_vals, y_vals, test_size=TEST_SIZE, random_state=RANDOM_STATE
+)
+
+# 5) Train XGBoost (stable defaults)
+xgb_model = xgb.XGBRegressor(
+    objective="reg:squarederror",
+    n_estimators=800,
+    learning_rate=0.05,
+    max_depth=8,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    min_child_weight=3,
+    reg_alpha=1e-6,
+    reg_lambda=1.0,
+    tree_method="hist",
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+xgb_model.fit(X_train, y_train)
+
+# 6) Evaluate
+y_pred = xgb_model.predict(X_test)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+r2   = r2_score(y_test, y_pred)
+print(f"Test RMSE: {rmse:.4f} | R²: {r2:.4f}")
+
+# Convert back to DataFrames for SHAP
+X_train_df = pd.DataFrame(X_train, columns=INPUT_COLS)
+X_test_df  = pd.DataFrame(X_test,  columns=INPUT_COLS)
+
+# 7) SHAP explainer
+# Use a small background for speed/stability
+try:
+    background = shap.utils.sample(X_train_df, min(200, len(X_train_df)), random_state=RANDOM_STATE)
+except Exception:
+    background = X_train_df
+
+explainer   = shap.TreeExplainer(xgb_model, data=background, feature_perturbation="interventional")
+shap_values = explainer(X_test_df)
+
+# ---------- PLOTS ----------
+# 7a) SHAP summary bar
+fig = plt.figure(figsize=(6, 10))
+shap.summary_plot(shap_values, X_test_df, plot_type="bar", show=False, max_display=MAX_DISPLAY)
+plt.xticks(fontsize=TICK_FS)
+plt.yticks(fontsize=TICK_FS)
+plt.xlabel("Mean |SHAP value|", fontsize=LABEL_FS)
+plt.ylabel("Features", fontsize=LABEL_FS)
+
+plt.tight_layout()
+if SAVE_TIFF:
+    plt.savefig("shap_summary_bar_STS.tiff", dpi=300, bbox_inches="tight", format="tiff")
+plt.show()
+
+# 7b) SHAP heatmap (with larger colorbar fonts)
+fig = plt.figure(figsize=(12, 8))
+shap.plots.heatmap(shap_values, max_display=MAX_DISPLAY, show=False)
+# Change SHAP heatmap colorbar label
+fig = plt.gcf()
+for ax in fig.axes:
+    if hasattr(ax, 'get_ylabel') and "SHAP value" in ax.get_ylabel():
+        ax.set_ylabel(f"SHAP value (impact on FS)", fontsize=COLORBAR_FS, labelpad=18)
+
+plt.xticks(fontsize=TICK_FS)
+plt.yticks(fontsize=TICK_FS)
+plt.xlabel("Instances", fontsize=LABEL_FS)
+
+plt.tight_layout()
+enlarge_colorbar_fonts(plt.gcf(), colorbar_fs=COLORBAR_FS, labelpad=18)
+if SAVE_TIFF:
+    plt.savefig("shap_heatmap_STS.tiff", dpi=300, bbox_inches="tight", format="tiff")
+plt.show()
+
+# 7c) SHAP beeswarm (with larger colorbar fonts)
+fig = plt.figure(figsize=(6, 12))
+shap.summary_plot(shap_values, X_test_df, show=False, max_display=MAX_DISPLAY)
+plt.xticks(fontsize=TICK_FS)
+plt.yticks(fontsize=TICK_FS)
+plt.xlabel("SHAP value (impact on FS)", fontsize=LABEL_FS)
+
+
+# <<< NEW: limit x-axis to [-20, +20]
+plt.xlim(-1, 1.5)
+
+plt.tight_layout()
+enlarge_colorbar_fonts(plt.gcf(), colorbar_fs=COLORBAR_FS, labelpad=18)
+if SAVE_TIFF:
+    plt.savefig("shap_beeswarm_CS.tiff", dpi=300, bbox_inches="tight", format="tiff")
+plt.show()
+
+
+print("Done.")
